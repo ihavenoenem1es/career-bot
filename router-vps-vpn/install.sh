@@ -15,7 +15,6 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-PUBLIC_NIC="${PUBLIC_NIC:-eth0}"
 WG_PORT="${WG_PORT:-51820}"
 WG_SERVER_ADDRESS="${WG_SERVER_ADDRESS:-10.44.0.1/24}"
 WG_SERVER_IP="${WG_SERVER_ADDRESS%/*}"
@@ -24,10 +23,8 @@ CLIENT_NAME="${CLIENT_NAME:-asus-router}"
 CLIENT_DNS="${CLIENT_DNS:-$WG_SERVER_IP}"
 CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS:-0.0.0.0/0,::/0}"
 CLIENT_PERSISTENT_KEEPALIVE="${CLIENT_PERSISTENT_KEEPALIVE:-25}"
-SSH_PORT="${SSH_PORT:-22}"
 ENABLE_ADGUARD="${ENABLE_ADGUARD:-1}"
-AGH_UPSTREAM_DNS="${AGH_UPSTREAM_DNS:-https://dns10.quad9.net/dns-query}"
-AGH_BOOTSTRAP_DNS="${AGH_BOOTSTRAP_DNS:-1.1.1.1}"
+INSTALL_ADGUARD="${INSTALL_ADGUARD:-1}"
 
 mkdir -p client backups
 
@@ -40,15 +37,31 @@ if [[ -z "$VPS_IP" ]]; then
   exit 1
 fi
 
+# Auto-detect public interface by default route. This is safer than hardcoded eth0.
+PUBLIC_NIC="${PUBLIC_NIC:-}"
+if [[ -z "$PUBLIC_NIC" ]]; then
+  PUBLIC_NIC="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+fi
+if [[ -z "$PUBLIC_NIC" ]]; then
+  echo "Не смог определить внешний сетевой интерфейс. Укажи PUBLIC_NIC=... в .env"
+  exit 1
+fi
+
+WG_SUBNET="${WG_SERVER_ADDRESS%.*}.0/24"
+
 echo "==> VPS IP: $VPS_IP"
 echo "==> Публичный интерфейс: $PUBLIC_NIC"
+echo "==> WireGuard subnet: $WG_SUBNET"
+echo "==> OpenVPN/Tailscale не трогаем. UFW/iptables-persistent специально НЕ ставим."
 
 apt update
-DEBIAN_FRONTEND=noninteractive apt install -y wireguard iptables iptables-persistent curl wget qrencode dnsutils ufw ca-certificates
+# Do not install ufw, iptables-persistent or netfilter-persistent here.
+# They conflict on some Ubuntu 24.04 servers with existing OpenVPN/Tailscale setups.
+DEBIAN_FRONTEND=noninteractive apt install -y wireguard iptables curl wget qrencode dnsutils ca-certificates
 
-# Backup existing WireGuard config if present
 if [[ -f /etc/wireguard/wg0.conf ]]; then
   cp /etc/wireguard/wg0.conf "backups/wg0.conf.$(date +%Y%m%d-%H%M%S)"
+  echo "==> Найден старый /etc/wireguard/wg0.conf, сделал backup в ./backups"
 fi
 
 SERVER_PRIVATE_KEY="$(wg genkey)"
@@ -63,8 +76,8 @@ PrivateKey = $SERVER_PRIVATE_KEY
 Address = $WG_SERVER_ADDRESS
 ListenPort = $WG_PORT
 SaveConfig = false
-PostUp = iptables -t nat -A POSTROUTING -s ${WG_SERVER_ADDRESS%.*}.0/24 -o $PUBLIC_NIC -j MASQUERADE; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s ${WG_SERVER_ADDRESS%.*}.0/24 -j TCPMSS --clamp-mss-to-pmtu
-PostDown = iptables -t nat -D POSTROUTING -s ${WG_SERVER_ADDRESS%.*}.0/24 -o $PUBLIC_NIC -j MASQUERADE; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -s ${WG_SERVER_ADDRESS%.*}.0/24 -j TCPMSS --clamp-mss-to-pmtu
+PostUp = iptables -t nat -C POSTROUTING -s $WG_SUBNET -o $PUBLIC_NIC -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $WG_SUBNET -o $PUBLIC_NIC -j MASQUERADE; iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT; iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -s $WG_SUBNET -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s $WG_SUBNET -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t nat -D POSTROUTING -s $WG_SUBNET -o $PUBLIC_NIC -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -s $WG_SUBNET -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 [Peer]
 # $CLIENT_NAME
@@ -74,7 +87,6 @@ AllowedIPs = ${WG_CLIENT_ADDRESS}
 EOF
 chmod 600 /etc/wireguard/wg0.conf
 
-# IPv4 forwarding and speed tuning
 cat >/etc/sysctl.d/99-router-vps-vpn.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.core.default_qdisc=fq
@@ -88,25 +100,16 @@ net.ipv4.tcp_wmem=4096 65536 67108864
 EOF
 sysctl --system >/dev/null || true
 
-ufw allow "${SSH_PORT}/tcp" || true
-ufw allow "${WG_PORT}/udp" || true
-if [[ "$ENABLE_ADGUARD" == "1" ]]; then
-  ufw allow from "${WG_SERVER_ADDRESS%.*}.0/24" to any port 53 proto tcp || true
-  ufw allow from "${WG_SERVER_ADDRESS%.*}.0/24" to any port 53 proto udp || true
-  ufw allow "3000/tcp" || true
-fi
-ufw --force enable || true
-
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
 
-# Install AdGuard Home best-effort
-if [[ "$ENABLE_ADGUARD" == "1" ]]; then
+if [[ "$ENABLE_ADGUARD" == "1" && "$INSTALL_ADGUARD" == "1" ]]; then
   if ! command -v AdGuardHome >/dev/null 2>&1 && [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
-    curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | bash
+    echo "==> Ставлю AdGuard Home"
+    curl -fsSL https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | bash || echo "AdGuard Home не установился автоматически, VPN всё равно готов."
   fi
-  systemctl enable AdGuardHome || true
-  systemctl restart AdGuardHome || true
+  systemctl enable AdGuardHome 2>/dev/null || true
+  systemctl restart AdGuardHome 2>/dev/null || true
 fi
 
 cat >"client/${CLIENT_NAME}.conf" <<EOF
